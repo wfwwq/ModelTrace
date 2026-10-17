@@ -95,6 +95,45 @@
         </form>
 
         <div id="enrollment-message" class="message" hidden></div>
+
+        <form id="multi-channel-form" class="form-panel multi-channel-panel">
+          <div class="form-heading">
+            <strong>多渠道整合校准</strong>
+            <span>把同一模型在多个渠道（官方 API、订阅、中转站……）的回答整合成一个指纹：先用可信渠道交叉校验，剔除疑似掉包的渠道，再按渠道等权建库并重新校准概率温度。</span>
+          </div>
+          <div class="mode-tabs channel-tabs" role="tablist" aria-label="渠道数据来源">
+            <button class="mode-tab active" data-channel-mode="api" type="button">API 自动采集</button>
+            <button class="mode-tab" data-channel-mode="paste" type="button">粘贴回答</button>
+          </div>
+          <div class="form-grid two">
+            <label><span>指纹名称（同一模型的统一标签）</span><input id="multi-model" list="model-options" required placeholder="例如 claude-opus-4-7"></label>
+            <label class="api-only"><span>每个渠道采集回答数</span><input id="multi-sample-count" type="number" min="3" max="36" value="36"></label>
+            <label class="api-only"><span>温度（可选）</span><input id="multi-temperature" type="number" min="0" max="2" step="0.1" placeholder="接口默认"></label>
+            <div class="channel-options">
+              <label class="checkbox"><input id="multi-keep-suspect" type="checkbox"><span>可疑渠道也并入</span></label>
+              <label class="checkbox"><input id="multi-dry-run" type="checkbox"><span>只校验，不写入指纹库</span></label>
+            </div>
+          </div>
+          <div id="channel-list" class="channel-list"></div>
+          <div class="form-footer">
+            <span>API Key 只用于本次请求，不写入磁盘。</span>
+            <div class="footer-buttons">
+              <button id="add-channel" class="button secondary" type="button">添加渠道</button>
+              <button class="button primary" type="submit">整合并校准</button>
+            </div>
+          </div>
+        </form>
+
+        <section class="form-panel calibration-tools">
+          <div class="form-heading"><strong>渠道一致性与校准</strong><span>对当前指纹库中已有多个渠道的模型做留一渠道校验，或按渠道感知算法重新校准。</span></div>
+          <div class="form-footer">
+            <button id="channel-report" class="button secondary" type="button">查看渠道一致性报告</button>
+            <button id="recalibrate" class="button secondary" type="button">重新校准指纹库</button>
+          </div>
+        </section>
+
+        <div id="multi-channel-message" class="message" hidden></div>
+        <section id="multi-channel-result" class="result-panel" hidden aria-live="polite"></section>
       </section>
     </main>
   </div>

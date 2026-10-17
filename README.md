@@ -21,6 +21,8 @@ python start.py
 - **API 自动测试**：填写 Base URL、API Key 和模型名。程序会自动尝试 OpenAI Chat Completions 与 Anthropic Messages 格式，以三份有效回答为目标完成归因。
 - **指纹库管理**：可以新建指纹库，或通过 API 为现有指纹库添加模型指纹。
 
+- **多渠道整合校准**：在“指纹库管理”中为同一个指纹名称添加多个渠道（官方 API、订阅、各家中转站……），可以 API 并行采集，也可以直接粘贴各渠道的回答。程序先做渠道一致性校验，剔除疑似掉包的渠道，再把通过的渠道整合进指纹并重新校准概率。
+
 API Key 只用于当前页面发起请求，不写入磁盘。
 自动采集会在对应的 `*_reference.jsonl` 中保存实际 user prompt、base prompt、system prompt 和 user prefix；拟合后的 `*_bank.json` 与 `unified_bank.json` 只保存统计指纹和校准参数。
 
@@ -52,6 +54,43 @@ P(模型家族) = Σ P(该家族中的具体模型)
 
 结果是当前候选库内、均匀先验下的闭集概率。未收录模型仍会被归到最相似的现有候选。
 
+### 多渠道整合与校准
+
+同一模型在不同渠道上的输出会带有渠道特有的偏差（系统提示词、包装层、采样参数，甚至被替换成别的模型）。只用一个渠道建立的指纹会把这些偏差一起记下来。多渠道整合分三步：
+
+1. **渠道一致性校验**：
+   - 该模型已有渠道时，以已有渠道为可信基准，用“可信渠道 + 库内其他全部模型”建库，识别每个新渠道的回答；
+   - 没有可信基准但有两个以上新渠道时，用留一渠道法互相校验；
+   - 只有一个渠道又没有同名指纹时，检查库内是否有其他模型能以高置信认领它（掉包预警）。
+
+   每个渠道给出单条回答命中率、整体归因和结论：`一致` / `偏弱` / `可疑` / `预警` / `无法校验`，并列出各渠道间的数字分布相似度。默认只有 `可疑` 渠道（整体归因到其他模型且单条命中率低于 30%）会被拒绝，可勾选“可疑渠道也并入”跳过。
+2. **整合**：通过校验的回答写入对应 `*_reference.jsonl`，每条带 `channel_id` / `channel_name`；旧数据没有该字段时以 `provider` 作为渠道。同一（模型, 渠道, 题目）重复导入是**替换**而不是追加——某个渠道采集中断了可以单独重采，不会让该渠道被重复计权；写入走临时文件 + 原子替换，中途失败不会留下半截数据。
+3. **渠道感知校准**（`bank_builder.py`）：
+   - 模型中心按渠道等权平均，避免样本多的渠道主导指纹；
+   - 在去除环境方向之后，再按（模型, 环境）分组估计同一模型不同渠道之间的偏移，取至多 2 个主方向作为“渠道干扰方向”一并投影掉；
+   - 温度交叉验证按（模型, 渠道）分组留出，并在该模型还有其他渠道时把被测渠道整体移出训练集，让概率反映“用其他渠道的指纹识别一个新渠道”的真实难度。
+
+   库中没有多渠道模型时，以上三点全部退化为原算法，结果与原版逐位一致。指纹库格式不变，浏览器版与 Codex 插件的评分代码无需修改。
+
+采集调度：多个渠道常常指向同一台中转站，程序按 `base_url` 主机分组，**同主机串行、跨主机并行**（默认 2 组并发，可用 `channel_workers` 调整），避免同一网关被自己的并发打到限流。
+
+**注意灰区**：建库只采用“每个模型都有数据”的完整环境（12 个）。用 `===OUTPUT===` 粘贴纯文本时无从得知题目，回答会落在 `manual` 环境，而其他模型都没有这个环境，因此**这些回答会写入参考数据，但不参与指纹估计**；界面和命令行会如实报告被排除的份数。想让粘贴的数据真正进指纹，请改用 jsonl 形式带上 `challenge_id`（每行 `{"challenge_id": "query-07", "text": "..."}`），环境会按标准挑战集自动补全。
+
+命令行同样可用：
+
+```powershell
+# 查看已有多渠道模型的一致性
+python channel_calibration.py report --bank claude
+# 导入多个渠道导出的回答（ModelTrace jsonl、{"challenge_id","text"} jsonl 或 ===OUTPUT=== 分隔的文本）
+python channel_calibration.py import --bank claude --model claude-opus-4-7 --channel 官方=official.jsonl --channel 中转A=relay_a.txt --dry-run
+# 按渠道感知算法重建并重新校准全部指纹库
+python channel_calibration.py rebuild
+# 回归测试
+python tests/test_channel_calibration.py
+```
+
+相关接口：`POST /api/enroll/multi`、`POST /api/channels/import`、`GET /api/channels/report`、`POST /api/calibrate`。
+
 ## 项目结构
 
 ```text
@@ -59,7 +98,8 @@ app.py              Web 接口
 fingerprint.py      指纹提取与归因
 bank_builder.py     指纹库构建与概率校准
 challenge_suite.py  自动建库挑战
-enrollment.py       API 调用与指纹采集
+enrollment.py       API 调用与指纹采集（含多渠道并行采集）
+channel_calibration.py  多渠道一致性校验、整合与校准
 rebuild_unified_bank.py  重建统一全局库
 data/               参考数据与指纹库
 static/             页面资源

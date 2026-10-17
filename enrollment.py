@@ -8,6 +8,7 @@ import re
 import secrets
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -53,6 +54,7 @@ def bank_summary(bank: dict) -> dict:
                 "display_name": model["display_name"],
                 "responses": model["response_count"],
                 "valid_numbers": model["valid_number_count"],
+                "channels": model.get("channels", {}),
             }
             for model in bank["models"]
         ],
@@ -73,6 +75,8 @@ def make_row(
     base_prompt: str | None = None,
     system_prompt: str | None = None,
     user_prefix: str | None = None,
+    channel_id: str | None = None,
+    channel_name: str | None = None,
 ) -> dict:
     numbers = parse_numbers(text)
     threshold = max(80, math.ceil(expected_count * 0.55)) if expected_count else 80
@@ -101,6 +105,7 @@ def make_row(
         "base_prompt": base_prompt,
         "system_prompt": system_prompt,
         "user_prefix": user_prefix,
+        **({"channel_id": channel_id, "channel_name": channel_name or channel_id} if channel_id else {}),
         "text": text,
         "error": None,
         "collected_at": datetime.now(timezone.utc).isoformat(),
@@ -363,25 +368,31 @@ def test_automatic(
     return result
 
 
-def enroll_automatic(
+def select_suite(sample_count: int) -> list[dict]:
+    suite = fingerprint_suite()
+    if sample_count < 3 or sample_count > len(suite):
+        raise ValueError(f"采集回答数必须在 3 到 {len(suite)} 之间")
+    return [suite[int(index * len(suite) / sample_count)] for index in range(sample_count)]
+
+
+def collect_suite(
     base_url: str,
     api_key: str,
     api_model: str,
     model_label: str,
-    sample_count: int,
+    tasks: list[dict],
     temperature: float | None,
-    api_format: str = "openai",
-    data_file: Path = DATA_FILE,
-    bank_file: Path = BANK_FILE,
+    api_format: str = "auto",
     bank_id: str = "reference-bank",
     provider: str = "api",
-) -> dict:
-    suite = fingerprint_suite()
-    if sample_count < 3 or sample_count > len(suite):
-        raise ValueError(f"采集回答数必须在 3 到 {len(suite)} 之间")
-    selected = [suite[int(index * len(suite) / sample_count)] for index in range(sample_count)]
-    rows = []
-    errors = []
+    channel_id: str | None = None,
+    channel_name: str | None = None,
+    workers: int = 2,
+) -> tuple[list[dict], list[str]]:
+    """按标准挑战集向一个渠道采集回答，返回 (有效行, 错误)。"""
+    rows: list[dict] = []
+    errors: list[str] = []
+    label = f"[{channel_name}] " if channel_name else ""
 
     def collect(task: dict) -> tuple[dict | None, list[str]]:
         task_errors = []
@@ -393,13 +404,7 @@ def enroll_automatic(
         for _ in range(2):
             try:
                 text = request_completion(
-                    base_url,
-                    api_key,
-                    api_model,
-                    prompt,
-                    temperature,
-                    api_format,
-                    system_prompt,
+                    base_url, api_key, api_model, prompt, temperature, api_format, system_prompt,
                 )
                 row = make_row(
                     model_label=model_label,
@@ -415,23 +420,47 @@ def enroll_automatic(
                     base_prompt=base_prompt,
                     system_prompt=system_prompt,
                     user_prefix=task["user_prefix"],
+                    channel_id=channel_id,
+                    channel_name=channel_name,
                 )
                 if row["strict_valid"]:
+                    row["response_model"] = api_model
                     return row, task_errors
                 task_errors.append(
-                    f"{task['challenge_id']} 有效数字不足：{row['parsed_count']}/{row['strict_threshold']}"
+                    f"{label}{task['challenge_id']} 有效数字不足：{row['parsed_count']}/{row['strict_threshold']}"
                 )
             except Exception as error:
-                task_errors.append(f"{task['challenge_id']}: {error}")
+                task_errors.append(f"{label}{task['challenge_id']}: {error}")
         return None, task_errors
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(collect, task) for task in selected]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(collect, task) for task in tasks]
         for future in as_completed(futures):
             row, task_errors = future.result()
             errors.extend(task_errors)
             if row is not None:
                 rows.append(row)
+    return rows, errors
+
+
+def enroll_automatic(
+    base_url: str,
+    api_key: str,
+    api_model: str,
+    model_label: str,
+    sample_count: int,
+    temperature: float | None,
+    api_format: str = "openai",
+    data_file: Path = DATA_FILE,
+    bank_file: Path = BANK_FILE,
+    bank_id: str = "reference-bank",
+    provider: str = "api",
+) -> dict:
+    selected = select_suite(sample_count)
+    rows, errors = collect_suite(
+        base_url, api_key, api_model, model_label, selected, temperature, api_format,
+        bank_id=bank_id, provider=provider,
+    )
     accepted = [row for row in rows if row["strict_valid"]]
     if not accepted:
         raise ValueError("没有获得可用回答，指纹库未修改")
@@ -445,3 +474,99 @@ def enroll_automatic(
         "errors": errors,
         "bank": bank_summary(bank),
     }
+
+
+def group_channels_by_host(channels: list[dict]) -> dict[str, list[dict]]:
+    """按 base_url 主机分组：同一网关上的渠道要排队，免得自己把自己的限流打满。"""
+    groups: dict[str, list[dict]] = {}
+    for channel in channels:
+        host = urllib.parse.urlparse(str(channel.get("base_url") or "").strip()).netloc.lower()
+        groups.setdefault(host, []).append(channel)
+    return groups
+
+
+def enroll_multi_channel(
+    channels: list[dict],
+    model_label: str,
+    sample_count: int,
+    temperature: float | None,
+    bank_id: str,
+    data_file: Path,
+    bank_file: Path,
+    keep_suspect: bool = False,
+    dry_run: bool = False,
+    api_format: str = "auto",
+    channel_workers: int = 2,
+) -> dict:
+    """从多个渠道采集同一模型的回答，校验渠道一致性后整合并重新校准指纹库。
+
+    channels：[{"name": "官方", "base_url": ..., "api_key": ..., "api_model": ...}, ...]
+
+    多个渠道常常指向同一台中转站：按主机分组，组内串行、组间并行，
+    避免同一网关被自己的并发打到限流（403/429）。
+    """
+    from channel_calibration import integrate_channels, slugify_channel
+
+    if not channels:
+        raise ValueError("至少需要一个渠道")
+    seen = set()
+    prepared = []
+    for index, channel in enumerate(channels, start=1):
+        name = (channel.get("name") or "").strip() or f"渠道{index}"
+        channel_id = slugify_channel(name)
+        if channel_id in seen:
+            raise ValueError(f"渠道名称重复：{name}")
+        seen.add(channel_id)
+        for key in ("base_url", "api_key", "api_model"):
+            if not str(channel.get(key) or "").strip():
+                raise ValueError(f"渠道 {name} 缺少 {key}")
+        prepared.append({**channel, "name": name, "channel_id": channel_id})
+    tasks = select_suite(sample_count)
+
+    def run(channel: dict) -> tuple[dict, list[dict], list[str]]:
+        rows, errors = collect_suite(
+            channel["base_url"].strip(),
+            channel["api_key"],
+            channel["api_model"].strip(),
+            model_label,
+            tasks,
+            temperature,
+            api_format,
+            bank_id=bank_id,
+            provider=channel["channel_id"],
+            channel_id=channel["channel_id"],
+            channel_name=channel["name"],
+        )
+        return channel, rows, errors
+
+    groups = group_channels_by_host(prepared)
+
+    def run_group(members: list[dict]) -> list[tuple[dict, list[dict], list[str]]]:
+        return [run(channel) for channel in members]
+
+    outcomes: list[tuple[dict, list[dict], list[str]]] = []
+    with ThreadPoolExecutor(max_workers=min(channel_workers, len(groups))) as pool:
+        for group_result in pool.map(run_group, groups.values()):
+            outcomes.extend(group_result)
+
+    all_rows: list[dict] = []
+    collection = []
+    for channel, rows, errors in outcomes:
+        all_rows.extend(rows)
+        collection.append(
+            {
+                "channel": channel["channel_id"],
+                "name": channel["name"],
+                "requested": sample_count,
+                "received": len(rows),
+                "errors": errors,
+            }
+        )
+    if not all_rows:
+        raise ValueError("所有渠道都没有获得可用回答，指纹库未修改")
+    result = integrate_channels(
+        bank_id, model_label, all_rows, keep_suspect=keep_suspect, dry_run=dry_run,
+        data_file=data_file, bank_file=bank_file,
+    )
+    result["collection"] = collection
+    return result

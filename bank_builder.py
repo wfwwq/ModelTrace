@@ -43,6 +43,72 @@ def read_rows(path: Path) -> list[dict]:
     return output
 
 
+CHANNEL_NUISANCE_RANK = 2
+
+
+def channel_of(row: dict) -> str:
+    """同一模型的不同采集渠道（中转站、官方 API、订阅客户端等）。
+
+    旧数据没有 channel_id 字段，回退到 provider，保证单渠道库的结果与原版完全一致。
+    """
+    return str(row.get("channel_id") or row.get("provider") or "default")
+
+
+def model_channels(rows: list[dict], model_ids: list[str]) -> dict[str, list[str]]:
+    return {
+        model_id: sorted({channel_of(row) for row in rows if row["source"] == model_id})
+        for model_id in model_ids
+    }
+
+
+def balanced_centroid(values: np.ndarray, labels: np.ndarray, channels: np.ndarray, model_id: str) -> np.ndarray:
+    """按渠道等权求模型中心：每个渠道先取均值再平均，避免某个渠道样本多就主导指纹。"""
+    selected = labels == model_id
+    channel_ids = sorted(set(channels[selected].tolist()))
+    if len(channel_ids) <= 1:
+        return values[selected].mean(axis=0)
+    return np.stack(
+        [values[selected & (channels == channel_id)].mean(axis=0) for channel_id in channel_ids]
+    ).mean(axis=0)
+
+
+def channel_nuisance_basis(
+    values: np.ndarray,
+    labels: np.ndarray,
+    channels: np.ndarray,
+    environments: np.ndarray,
+    model_ids: list[str],
+) -> np.ndarray:
+    """估计“渠道干扰方向”：同一模型、同一环境下，不同渠道之间的平均偏移。
+
+    按 (模型, 环境) 分组比较，避免渠道覆盖的环境不同而把环境差异误当成渠道差异。
+    只有拥有两个以上渠道的模型参与；不存在多渠道模型时返回空基，行为与原算法一致。
+    输入 values 已经去除了环境方向，因此返回的基与环境基正交。
+    """
+    offsets = []
+    for model_id in model_ids:
+        selected = labels == model_id
+        if len(set(channels[selected].tolist())) < 2:
+            continue
+        for environment in sorted(set(environments[selected].tolist())):
+            group = selected & (environments == environment)
+            channel_ids = sorted(set(channels[group].tolist()))
+            if len(channel_ids) < 2:
+                continue
+            means = np.stack(
+                [values[group & (channels == channel_id)].mean(axis=0) for channel_id in channel_ids]
+            )
+            offsets.extend(means - means.mean(axis=0, keepdims=True))
+    if not offsets:
+        return np.empty((0, values.shape[1]), dtype=np.float64)
+    matrix = np.stack(offsets)
+    _, singular, right = np.linalg.svd(matrix, full_matrices=False)
+    if not singular.size or not singular[0]:
+        return np.empty((0, values.shape[1]), dtype=np.float64)
+    rank = min(CHANNEL_NUISANCE_RANK, int(np.sum(singular > singular[0] * 1e-8)))
+    return right[:rank]
+
+
 def fit_robust_artifacts(rows: list[dict], model_ids: list[str]) -> dict:
     environments = sorted({row["condition_id"] for row in rows})
     complete = [
@@ -89,8 +155,14 @@ def fit_robust_artifacts(rows: list[dict], model_ids: list[str]) -> dict:
         standardized -= (standardized @ basis.T) @ basis
 
     labels = np.asarray([row["source"] for row in robust_rows])
+    channels = np.asarray([channel_of(row) for row in robust_rows])
+    row_environments = np.asarray([row["condition_id"] for row in robust_rows])
+    channel_basis = channel_nuisance_basis(standardized, labels, channels, row_environments, model_ids)
+    if len(channel_basis):
+        standardized -= (standardized @ channel_basis.T) @ channel_basis
+        basis = np.vstack([basis, channel_basis])
     centroids = np.stack(
-        [standardized[labels == model_id].mean(axis=0) for model_id in model_ids]
+        [balanced_centroid(standardized, labels, channels, model_id) for model_id in model_ids]
     )
     centroid_norms = np.linalg.norm(centroids, axis=1, keepdims=True)
     centroids /= np.maximum(centroid_norms, 1e-12)
@@ -118,8 +190,14 @@ def fit_robust_artifacts(rows: list[dict], model_ids: list[str]) -> dict:
         rank = min(2, int(np.sum(singular > singular[0] * 1e-8))) if singular[0] else 0
         ordered_basis = right[:rank]
         ordered_standardized -= (ordered_standardized @ ordered_basis.T) @ ordered_basis
+    ordered_channel_basis = channel_nuisance_basis(
+        ordered_standardized, labels, channels, row_environments, model_ids
+    )
+    if len(ordered_channel_basis):
+        ordered_standardized -= (ordered_standardized @ ordered_channel_basis.T) @ ordered_channel_basis
+        ordered_basis = np.vstack([ordered_basis, ordered_channel_basis])
     ordered_centroids = np.stack(
-        [ordered_standardized[labels == model_id].mean(axis=0) for model_id in model_ids]
+        [balanced_centroid(ordered_standardized, labels, channels, model_id) for model_id in model_ids]
     )
     ordered_centroids /= np.maximum(np.linalg.norm(ordered_centroids, axis=1, keepdims=True), 1e-12)
     ordered_environment_centroids = []
@@ -136,7 +214,9 @@ def fit_robust_artifacts(rows: list[dict], model_ids: list[str]) -> dict:
                 ],
                 dtype=bool,
             )
-            centroid = unprojected_ordered[indices].mean(axis=0)
+            centroid = balanced_centroid(
+                unprojected_ordered[indices], labels[indices], channels[indices], model_id
+            )
             centroid /= max(float(np.linalg.norm(centroid)), 1e-12)
             environment_centroids.append(centroid)
         ordered_environment_centroids.append(np.stack(environment_centroids))
@@ -147,6 +227,7 @@ def fit_robust_artifacts(rows: list[dict], model_ids: list[str]) -> dict:
         "robust_ready": robust_ready,
         "training_rows": len(robust_rows),
         "complete_environments": complete,
+        "channel_nuisance_rank": int(len(channel_basis)),
         "hellinger": {
             "feature_mean": feature_mean.tolist(),
             "feature_scale": feature_scale.tolist(),
@@ -168,8 +249,21 @@ def fit_robust_artifacts(rows: list[dict], model_ids: list[str]) -> dict:
     }
 
 
-def calibration_records(rows: list[dict], model_ids: list[str], query_count: int) -> list[tuple[list[float], int]]:
+def calibration_records(
+    rows: list[dict],
+    model_ids: list[str],
+    query_count: int,
+    cross_channel: bool = True,
+) -> list[tuple[list[float], int]]:
+    """分组交叉验证，产出 (各模型得分, 真实模型序号) 记录用于拟合温度。
+
+    - 按挑战分组留出：留出的挑战不参与训练（原算法）。
+    - 渠道感知：同一模型的每个渠道单独组成一组留出回答，因此多渠道模型会贡献多条记录。
+    - cross_channel：若该模型还有其他渠道，额外把被测渠道的全部回答从训练集中移除，
+      让温度反映“用其他渠道的指纹识别一个新渠道”的真实难度，防止渠道特有偏差泄漏。
+    """
     records = []
+    channels_by_model = model_channels(rows, model_ids)
     conditions = sorted({row["condition_id"] for row in rows})
     for condition in conditions:
         challenge_ids = sorted({row["challenge_id"] for row in rows if row["condition_id"] == condition})
@@ -189,24 +283,47 @@ def calibration_records(rows: list[dict], model_ids: list[str], query_count: int
         for held_ids in itertools.combinations(challenge_ids, query_count):
             held_set = set(held_ids)
             train = [row for row in rows if row["challenge_id"] not in held_set]
-            robust = fit_robust_artifacts(train, model_ids)
-            score_bank = {"robust": robust}
+            shared_bank = None
+            # 跨渠道留出按渠道缓存：同一渠道（如同一家中转站）承载的多个模型共用一次拟合。
+            channel_banks: dict[str, dict] = {}
             for truth_index, model_id in enumerate(model_ids):
-                held = [
-                    row
-                    for row in rows
-                    if row["source"] == model_id and row["challenge_id"] in held_set
-                ]
-                if len(held) != query_count:
-                    continue
-                response_scores = [
-                    robust_score_numbers(row["numbers"], score_bank)["fused"] for row in held
-                ]
-                combined = [
-                    sum(scores[index] for scores in response_scores) / query_count
-                    for index in range(len(model_ids))
-                ]
-                records.append((combined, truth_index))
+                channel_ids = channels_by_model[model_id]
+                for channel_id in channel_ids:
+                    held = [
+                        row
+                        for row in rows
+                        if row["source"] == model_id
+                        and channel_of(row) == channel_id
+                        and row["challenge_id"] in held_set
+                    ]
+                    if len(held) != query_count:
+                        continue
+                    if cross_channel and len(channel_ids) > 1:
+                        if channel_id not in channel_banks:
+                            channel_train = [
+                                row
+                                for row in train
+                                if not (
+                                    channel_of(row) == channel_id
+                                    and len(channels_by_model[row["source"]]) > 1
+                                )
+                            ]
+                            channel_banks[channel_id] = {
+                                "robust": fit_robust_artifacts(channel_train, model_ids)
+                            }
+                        score_bank = channel_banks[channel_id]
+                    else:
+                        if shared_bank is None:
+                            shared_bank = {"robust": fit_robust_artifacts(train, model_ids)}
+                        score_bank = shared_bank
+                    response_scores = [
+                        robust_score_numbers(row["numbers"], score_bank)["fused"] for row in held
+                    ]
+                    combined = [
+                        sum(scores[index] for scores in response_scores) / query_count
+                        for index in range(len(model_ids))
+                    ]
+                    records.append((combined, truth_index))
     return records
 
 
@@ -228,7 +345,11 @@ def fit_beta(records: list[tuple[list[float], int]]) -> tuple[float, float]:
     return best_beta, best_loss
 
 
-def build_bank(rows: list[dict], fallback_calibration: dict | None = None) -> dict:
+def build_bank(
+    rows: list[dict],
+    fallback_calibration: dict | None = None,
+    cross_channel: bool = True,
+) -> dict:
     model_ids = list(dict.fromkeys(row["source"] for row in rows))
     model_entries = []
     for model_id in model_ids:
@@ -245,6 +366,7 @@ def build_bank(rows: list[dict], fallback_calibration: dict | None = None) -> di
                 "response_count": len(selected),
                 "valid_number_count": sum(len(row["numbers"]) for row in selected),
                 "conditions": dict(Counter(row["condition_id"] for row in selected)),
+                "channels": dict(Counter(channel_of(row) for row in selected)),
                 "counts": pooled,
             }
         )
@@ -252,7 +374,7 @@ def build_bank(rows: list[dict], fallback_calibration: dict | None = None) -> di
     robust = fit_robust_artifacts(rows, model_ids)
     calibration = {}
     for query_count in (1, 2, 3):
-        records = calibration_records(rows, model_ids, query_count)
+        records = calibration_records(rows, model_ids, query_count, cross_channel)
         key = str(query_count)
         if records:
             beta, nll = fit_beta(records)
@@ -282,6 +404,11 @@ def build_bank(rows: list[dict], fallback_calibration: dict | None = None) -> di
             }
 
     providers = sorted({row.get("provider") for row in rows if row.get("provider")})
+    multi_channel_models = {
+        model_id: channel_ids
+        for model_id, channel_ids in model_channels(rows, model_ids).items()
+        if len(channel_ids) > 1
+    }
     source_scope = "Reference outputs enrolled for the listed model labels."
     method_name = "Ordered-block + nuisance-Hellinger"
     return {
@@ -301,6 +428,13 @@ def build_bank(rows: list[dict], fallback_calibration: dict | None = None) -> di
         "minimum_valid_numbers": 80,
         "source_scope": source_scope,
         "providers": providers,
+        "multi_channel_models": multi_channel_models,
+        "channel_calibration": {
+            "enabled": bool(multi_channel_models),
+            "cross_channel_holdout": bool(cross_channel and multi_channel_models),
+            "channel_nuisance_rank": robust["channel_nuisance_rank"],
+            "centroid_weighting": "channel-balanced" if multi_channel_models else "row-mean",
+        },
         "models": model_entries,
         "robust": robust,
         "calibration": calibration,

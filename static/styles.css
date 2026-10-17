@@ -138,6 +138,7 @@ label code { color: var(--primary-dark); }
 .diagnostic.accepted { color: var(--success); background: var(--success-soft); }
 .diagnostic.rejected { color: var(--danger); background: var(--danger-soft); }
 .result-note { display: flex; justify-content: space-between; gap: 16px; padding: 10px 17px; color: var(--muted); font-size: 10px; border-top: 1px solid var(--line); }
+.result-note.warn { display: block; color: var(--warning); background: var(--warning-soft); border-top-color: #eedca6; font-size: 11px; }
 .result-guidance { padding: 12px 17px; color: var(--muted); font-size: 11px; line-height: 1.7; border-top: 1px solid var(--line); }
 .result-guidance p { margin: 0; }
 .result-guidance p + p { margin-top: 4px; }
@@ -197,3 +198,27 @@ tbody tr.winner { background: var(--primary-soft); }
   .inventory-summary > div:nth-child(4) { border-top: 1px solid var(--line); }
   .button { width: 100%; }
 }
+
+/* 多渠道整合校准 */
+.multi-channel-panel, .calibration-tools { margin-top: 16px; }
+.channel-tabs { margin: 14px 17px 0; }
+.channel-options { display: flex; align-items: flex-end; gap: 18px; }
+.checkbox { display: flex !important; flex-direction: row !important; align-items: center; gap: 7px; font-size: 12px; }
+.checkbox input { width: auto; height: auto; }
+.channel-list { display: grid; gap: 10px; padding: 0 17px 17px; }
+.channel-card { border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); }
+.channel-card-header { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12px; font-weight: 650; }
+.channel-card-header button { color: var(--danger); border: 0; background: transparent; font-size: 11px; font-weight: 650; }
+.channel-card .form-grid { padding: 12px; }
+.channel-card textarea { min-height: 140px; }
+.multi-channel-panel[data-mode="paste"] .api-only, .multi-channel-panel[data-mode="api"] .paste-only { display: none !important; }
+.footer-buttons { display: flex; gap: 10px; }
+.calibration-tools .form-footer { justify-content: flex-start; gap: 10px; }
+.verdict { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 650; white-space: nowrap; }
+.verdict.consistent { color: var(--success); background: var(--success-soft); }
+.verdict.weak, .verdict.warning { color: var(--warning); background: var(--warning-soft); }
+.verdict.suspect { color: var(--danger); background: var(--danger-soft); }
+.verdict.unknown { color: var(--muted); background: #eef0f3; }
+.channel-report + .channel-report { border-top: 1px solid var(--line); }
+.channel-report h3 { margin: 0; padding: 14px 17px 4px; font-size: 14px; }
+.channel-report .result-note { padding: 4px 17px 12px; color: var(--muted); font-size: 12px; }

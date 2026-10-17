@@ -8,7 +8,20 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from enrollment import bank_summary, enroll_automatic, request_completion, test_automatic
+from enrollment import (
+    bank_summary,
+    enroll_automatic,
+    enroll_multi_channel,
+    request_completion,
+    test_automatic,
+)
+from channel_calibration import (
+    bank_channel_overview,
+    integrate_channels,
+    rebuild_bank_file,
+    rebuild_unified,
+    rows_from_text,
+)
 from fingerprint import analyze_global_outputs, generate_challenges, load_bank, parse_numbers
 from bank_builder import build_bank, read_rows
 
@@ -294,6 +307,126 @@ def automatic_enrollment():
         result["unified"] = summarized_unified_bank()
         return jsonify(result)
     except (RuntimeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
+
+
+def reload_after_calibration(bank_id: str) -> None:
+    """channel_calibration 已经写好了 bank 文件和统一库，这里只重新加载，避免再次重建。"""
+    global unified_bank
+    banks[bank_id] = load_configured_bank(bank_id)
+    unified_bank = load_bank(UNIFIED_BANK_FILE)
+
+
+def multi_channel_response(bank_id: str, result: dict) -> dict:
+    if not result.get("dry_run") and result.get("accepted_responses"):
+        reload_after_calibration(bank_id)
+    result["bank"] = summarized_bank(bank_id)
+    result["unified"] = summarized_unified_bank()
+    result["banks"] = {item: summarized_bank(item) for item in BANK_CONFIGS}
+    return result
+
+
+@app.post("/api/enroll/multi")
+def multi_channel_enrollment():
+    """多渠道采集同一模型 → 渠道一致性校验 → 整合并重新校准。"""
+    payload = request.get_json()
+    try:
+        bank_id = requested_bank_id(payload)
+        config = BANK_CONFIGS[bank_id]
+        model_label = payload["model_label"].strip()
+        if not model_label:
+            raise ValueError("请输入指纹名称")
+        result = enroll_multi_channel(
+            channels=payload.get("channels") or [],
+            model_label=model_label,
+            sample_count=int(payload.get("sample_count", 36)),
+            temperature=requested_temperature(payload),
+            bank_id=bank_id,
+            data_file=config["data_file"],
+            bank_file=config["bank_file"],
+            keep_suspect=bool(payload.get("keep_suspect")),
+            dry_run=bool(payload.get("dry_run")),
+            channel_workers=max(1, int(payload.get("channel_workers", 2))),
+        )
+        return jsonify(multi_channel_response(bank_id, result))
+    except (RuntimeError, ValueError, KeyError) as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.post("/api/channels/import")
+def import_channel_outputs():
+    """粘贴多个渠道的回答（每个渠道一段文本，回答之间用 ===OUTPUT=== 分隔，或 jsonl）。"""
+    payload = request.get_json()
+    try:
+        bank_id = requested_bank_id(payload)
+        config = BANK_CONFIGS[bank_id]
+        model_label = payload["model_label"].strip()
+        if not model_label:
+            raise ValueError("请输入指纹名称")
+        rows = []
+        for index, channel in enumerate(payload.get("channels") or [], start=1):
+            raw = str(channel.get("text") or "").strip()
+            if not raw:
+                continue
+            name = (channel.get("name") or "").strip() or f"渠道{index}"
+            is_jsonl = raw.startswith("{")
+            rows.extend(rows_from_text(raw, name, model_label, bank_id, is_jsonl))
+        result = integrate_channels(
+            bank_id,
+            model_label,
+            rows,
+            keep_suspect=bool(payload.get("keep_suspect")),
+            dry_run=bool(payload.get("dry_run")),
+            data_file=config["data_file"],
+            bank_file=config["bank_file"],
+        )
+        return jsonify(multi_channel_response(bank_id, result))
+    except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.get("/api/channels/report")
+def channel_consistency_report():
+    """对指纹库中所有多渠道模型做留一渠道一致性校验。"""
+    try:
+        bank_id = requested_bank_id()
+        config = BANK_CONFIGS[bank_id]
+        reference = [
+            {**row, "family_id": item, "family_name": BANK_CONFIGS[item]["label"]}
+            for item in active_banks()
+            for row in read_rows(BANK_CONFIGS[item]["data_file"])
+        ]
+        own_models = {row["source"] for row in read_rows(config["data_file"])} if config["data_file"].exists() else set()
+        reports = [
+            report
+            for report in bank_channel_overview(reference, (unified_bank or {}).get("calibration"))
+            if report["model"] in own_models
+        ]
+        return jsonify({"bank_id": bank_id, "reports": reports})
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.post("/api/calibrate")
+def recalibrate():
+    """按渠道感知算法重建指纹库并重新拟合温度。"""
+    payload = request.get_json(silent=True) or {}
+    try:
+        bank_id = requested_bank_id(payload)
+        config = BANK_CONFIGS[bank_id]
+        if config["data_file"].exists() and read_rows(config["data_file"]):
+            rebuild_bank_file(config["data_file"], config["bank_file"])
+        rebuild_unified()
+        reload_after_calibration(bank_id)
+        return jsonify(
+            {
+                "bank": summarized_bank(bank_id),
+                "unified": summarized_unified_bank(),
+                "calibration": unified_bank["calibration"],
+                "channel_calibration": unified_bank.get("channel_calibration"),
+            }
+        )
+    except ValueError as error:
         return jsonify({"error": str(error)}), 400
 
 
